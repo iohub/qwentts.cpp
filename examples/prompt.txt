@@ -1,1 +1,1 @@
-qwentts.cpp is a minimal C++17 and GGML port of Qwen3-TTS for zero shot multilingual text to speech.
+今天天气不错出去走走吧，别当牛马了，这世界还有很多美好的事。
