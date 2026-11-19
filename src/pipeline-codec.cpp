@@ -110,24 +110,30 @@ bool pipeline_codec_load(PipelineCodec * pc, const char * gguf_path, BackendPair
     return true;
 }
 
-std::vector<float> pipeline_codec_decode(PipelineCodec * pc, const int32_t * codes, int K, int T) {
-    if (K != TOKENIZER_NUM_CODEBOOKS) {
-        qt_log(QT_LOG_ERROR, "[Pipeline] codes have %d codebooks, expected %d", K, TOKENIZER_NUM_CODEBOOKS);
-        return {};
-    }
-    if (T <= 0) {
-        qt_log(QT_LOG_ERROR, "[Pipeline] T must be > 0 (got %d)", T);
-        return {};
-    }
+// Upper bound on the tensors of one codec decode/encode graph. Matches the
+// graph size hint handed to backend_sched_new() in pipeline_codec_load, which
+// is what sizes the scheduler hash set and the split context buffer.
+static const int CODEC_GRAPH_MAX_NODES = 4096;
 
-    // Persistent arena: identical slice widths rebuild every node at
-    // the same address with identical shapes, so the backend CUDA graph
-    // cache replays the captured executable without an update. Steady
-    // state streaming decodes constant size slices and hits this path
-    // on every emit.
-    const int             n_max_nodes = 4096;
-    struct ggml_context * gctx        = graph_arena_begin(&pc->dec_arena);
-
+// Build the full buffered decode graph into `gctx`.
+//
+// The pipeline stages are: codes/positions/mask inputs -> RVQ quantizer decode
+// -> pre_conv -> transformer -> upsample -> DAC -> clamp -> audio_out. Every
+// tensor shape is a pure function of (K, T), so the scheduler can reserve
+// buffers from a measure graph built by this very function in a throwaway
+// context and the layout then matches the real graph exactly.
+//
+// Input tensors are returned through the out parameters so that the caller can
+// upload data after the scheduler allocated them; pass NULL for any of them to
+// ignore it.
+static struct ggml_cgraph * codec_build_decode_graph(struct ggml_context * gctx,
+                                                     PipelineCodec *       pc,
+                                                     int                   K,
+                                                     int                   T,
+                                                     struct ggml_tensor ** out_codes,
+                                                     struct ggml_tensor ** out_positions,
+                                                     struct ggml_tensor ** out_mask,
+                                                     struct ggml_tensor ** out_audio) {
     // Inputs: codes [T, K] i32, positions [T] i32, mask [T, T] f32.
     struct ggml_tensor * codes_in = ggml_new_tensor_2d(gctx, GGML_TYPE_I32, T, K);
     ggml_set_name(codes_in, "codes_in");
@@ -156,13 +162,158 @@ std::vector<float> pipeline_codec_decode(PipelineCodec * pc, const int32_t * cod
     ggml_set_name(h, "audio_out");
     ggml_set_output(h);
 
-    struct ggml_cgraph * graph = ggml_new_graph_custom(gctx, n_max_nodes, false);
+    struct ggml_cgraph * graph = ggml_new_graph_custom(gctx, CODEC_GRAPH_MAX_NODES, false);
     ggml_build_forward_expand(graph, h);
 
-    ggml_backend_sched_reset(pc->sched);
-    if (!ggml_backend_sched_alloc_graph(pc->sched, graph)) {
-        qt_log(QT_LOG_ERROR, "[Pipeline] sched_alloc_graph failed");
+    if (out_codes) {
+        *out_codes = codes_in;
+    }
+    if (out_positions) {
+        *out_positions = positions;
+    }
+    if (out_mask) {
+        *out_mask = mask;
+    }
+    if (out_audio) {
+        *out_audio = h;
+    }
+    return graph;
+}
+
+// Reserve pc->sched for a graph of the given shape, then allocate the real
+// graph on it. Returns the allocated real graph, or NULL after logging.
+//
+// Why an explicit reserve is required here
+// ---------------------------------------
+// ggml_gallocr_needs_realloc() (ggml-alloc.c) only compares the node and leaf
+// counts plus the per node/src size_max of the recorded layout; it never looks
+// at the leaf sizes stored in galloc->leaf_allocs and never checks the actual
+// capacity of the backend buffers. The decode graph is rebuilt from a
+// persistent arena on every call, so every rebuild yields the same op
+// sequence, the same node and leaf counts and even the same tensor addresses:
+// that check keeps answering "the previous layout still fits" while the
+// buffered chunked decode keeps changing T (300, then 300 + left_ctx, ...) and
+// the mask [T, T] plus the DAC/vocoder activations grow with it.
+// ggml_gallocr_init_tensor() then writes the new, larger tensor through the
+// previous layout's address and trips the bounds assert inside
+// ggml_backend_tensor_alloc() (ggml-backend.cpp). The first decode after
+// start-up is safe only because galloc->buffers[i] is still NULL, which forces
+// ggml_gallocr_reserve_n_impl() to size the buffers for that exact graph -
+// hence "first request works, later ones abort".
+//
+// ggml_backend_sched_reserve() always re-runs ggml_gallocr_alloc_graph_impl()
+// (it resets every tallocr first) and grows the backend buffers when the new
+// maxima exceed the current chunk sizes, so reserving before every allocation
+// removes this whole class of stale-layout failures. The layout is
+// deterministic for a given shape, so repeated calls with the same T produce
+// the same addresses and keep the backend CUDA graph cache warm.
+//
+// The measure graph MUST live in its own throwaway context:
+// ggml_backend_sched_split_graph() frees and re-initialises sched->ctx and
+// rewrites the measured graph's cross-backend src pointers to copies owned by
+// that context. Measuring the real graph would leave those src pointers
+// dangling for the alloc_graph below. For the same reason `build_real` is
+// invoked again on the retry: split_graph() rewrites the graph object it is
+// handed, so a graph may only ever go through a single split pass.
+template <typename BuildReal, typename BuildMeasure>
+static struct ggml_cgraph * codec_sched_reserve_and_alloc(PipelineCodec * pc,
+                                                          BuildReal       build_real,
+                                                          BuildMeasure    build_measure,
+                                                          const char *    label) {
+    for (int attempt = 0; attempt < 2; attempt++) {
+        struct ggml_cgraph * graph = build_real();
+        if (!graph) {
+            ggml_backend_sched_reset(pc->sched);
+            return NULL;
+        }
+
+        // Drop the backend assignments left over from the previous decode: the
+        // arena hands out the same tensor addresses again, so a stale id would
+        // otherwise be picked up by the split pass below.
         ggml_backend_sched_reset(pc->sched);
+
+        const size_t measure_bytes = ggml_tensor_overhead() * (size_t) CODEC_GRAPH_MAX_NODES +
+                                     ggml_graph_overhead_custom((size_t) CODEC_GRAPH_MAX_NODES, false);
+        struct ggml_init_params mp   = { measure_bytes, NULL, /*no_alloc=*/true };
+        struct ggml_context *   mctx = ggml_init(mp);
+        if (!mctx) {
+            qt_log(QT_LOG_ERROR, "[Pipeline] %s: ggml_init failed for measure ctx (%zu bytes)", label, measure_bytes);
+            ggml_backend_sched_reset(pc->sched);
+            return NULL;
+        }
+
+        struct ggml_cgraph * measure  = build_measure(mctx);
+        const int            m_nodes  = measure ? ggml_graph_n_nodes(measure) : -1;
+        const bool           reserved = measure && ggml_backend_sched_reserve(pc->sched, measure);
+        // reserve() rewrote `measure` through sched->ctx; the measure context
+        // and every tensor it owns are dead from here on.
+        ggml_free(mctx);
+
+        if (!reserved) {
+            qt_log(QT_LOG_ERROR, "[Pipeline] %s: sched_reserve failed (measure graph %d nodes)", label, m_nodes);
+            ggml_backend_sched_reset(pc->sched);
+            return NULL;
+        }
+
+        if (ggml_backend_sched_alloc_graph(pc->sched, graph)) {
+            qt_log(QT_LOG_DEBUG, "[Pipeline] codec sched reserved: %s, graph %d nodes, buffer %.2f MiB", label, m_nodes,
+                   (double) ggml_backend_sched_get_buffer_size(pc->sched, pc->backend) / (1024.0 * 1024.0));
+            return graph;
+        }
+
+        // Even a reserve for this exact shape did not make alloc_graph happy.
+        // Retry once with a graph rebuilt from scratch (see the split pass note
+        // above), and only report failure when that fails too.
+        qt_log(QT_LOG_DEBUG, "[Pipeline] %s: sched_alloc_graph failed after reserve, retrying once", label);
+        ggml_backend_sched_reset(pc->sched);
+    }
+
+    qt_log(QT_LOG_ERROR, "[Pipeline] %s: sched reserve/alloc failed after retry", label);
+    ggml_backend_sched_reset(pc->sched);
+    return NULL;
+}
+
+std::vector<float> pipeline_codec_decode(PipelineCodec * pc, const int32_t * codes, int K, int T) {
+    if (K != TOKENIZER_NUM_CODEBOOKS) {
+        qt_log(QT_LOG_ERROR, "[Pipeline] codes have %d codebooks, expected %d", K, TOKENIZER_NUM_CODEBOOKS);
+        return {};
+    }
+    if (T <= 0) {
+        qt_log(QT_LOG_ERROR, "[Pipeline] T must be > 0 (got %d)", T);
+        return {};
+    }
+
+    // Persistent arena: identical slice widths rebuild every node at
+    // the same address with identical shapes, so the backend CUDA graph
+    // cache replays the captured executable without an update. Steady
+    // state streaming decodes constant size slices and hits this path
+    // on every emit.
+    struct ggml_tensor * codes_in  = NULL;
+    struct ggml_tensor * positions = NULL;
+    struct ggml_tensor * mask      = NULL;
+    struct ggml_tensor * audio_out = NULL;
+
+    // Rebuilt for every reserve/alloc attempt: the scheduler's split pass
+    // rewrites cross-backend src pointers of the graph it is handed into
+    // sched->ctx, so a graph object is good for exactly one allocation.
+    auto build_real = [&]() -> struct ggml_cgraph * {
+        struct ggml_context * gctx = graph_arena_begin(&pc->dec_arena);
+        return codec_build_decode_graph(gctx, pc, K, T, &codes_in, &positions, &mask, &audio_out);
+    };
+
+    // The measure graph reuses the very same builder, so its op sequence and
+    // every tensor shape match the real graph exactly; only the context (and
+    // therefore the addresses) differ.
+    auto build_measure = [&](struct ggml_context * mctx) -> struct ggml_cgraph * {
+        return codec_build_decode_graph(mctx, pc, K, T, NULL, NULL, NULL, NULL);
+    };
+
+    char label[64];
+    snprintf(label, sizeof(label), "decode T=%d K=%d", T, K);
+
+    struct ggml_cgraph * graph = codec_sched_reserve_and_alloc(pc, build_real, build_measure, label);
+    if (!graph) {
+        qt_log(QT_LOG_ERROR, "[Pipeline] sched_alloc_graph failed");
         return {};
     }
 
@@ -189,7 +340,7 @@ std::vector<float> pipeline_codec_decode(PipelineCodec * pc, const int32_t * cod
     // into the next decode.
     const int          n_samples = T * TOKENIZER_HOP_LENGTH;
     std::vector<float> audio((size_t) n_samples);
-    ggml_backend_tensor_get(h, audio.data(), 0, (size_t) n_samples * sizeof(float));
+    ggml_backend_tensor_get(audio_out, audio.data(), 0, (size_t) n_samples * sizeof(float));
     return audio;
 }
 
@@ -734,41 +885,40 @@ bool pipeline_codec_ensure_encoder(PipelineCodec * pc) {
     return true;
 }
 
-std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc,
-                                           const float *   audio,
-                                           int             n_samples,
-                                           const char *    dump_dir) {
-    if (!pipeline_codec_ensure_encoder(pc)) {
-        qt_log(QT_LOG_ERROR, "[Pipeline] codec encoder load failed");
-        return {};
-    }
-    if (n_samples <= 0 || (n_samples % TOKENIZER_HOP_LENGTH) != 0) {
-        qt_log(QT_LOG_ERROR, "[Pipeline] n_samples must be a positive multiple of %d (got %d)", TOKENIZER_HOP_LENGTH,
-               n_samples);
-        return {};
-    }
-    int T = n_samples / TOKENIZER_HOP_LENGTH;
+// Optional tap tensors of the encoder chain, pinned as extra graph outputs
+// when a debug dump directory is requested.
+struct CodecEncodeTaps {
+    struct ggml_tensor * h_seanet   = NULL;
+    struct ggml_tensor * h_et       = NULL;
+    struct ggml_tensor * sn_init    = NULL;
+    struct ggml_tensor * sn_resnet0 = NULL;
+    struct ggml_tensor * sn_stage0  = NULL;
+    struct ggml_tensor * sn_stage1  = NULL;
+    struct ggml_tensor * sn_stage3  = NULL;
+};
 
-    // Lazy-load CPU mirror of the RVQ encode codebooks on first call.
-    if (!pc->qenc_host_ready) {
-        quant_encode_host_load(&pc->qenc_sem_host, pc->qenc.semantic, pc->qenc.codebook_size, pc->qenc.codebook_dim,
-                               pc->qenc.hidden_size);
-        quant_encode_host_load(&pc->qenc_aco_host, pc->qenc.acoustic, pc->qenc.codebook_size, pc->qenc.codebook_dim,
-                               pc->qenc.hidden_size);
-        pc->qenc_host_ready = true;
-    }
-
-    const int    n_max_nodes = 4096;
-    const size_t graph_ctx_size =
-        ggml_tensor_overhead() * (size_t) n_max_nodes + ggml_graph_overhead_custom((size_t) n_max_nodes, false);
-
-    struct ggml_init_params gp   = { graph_ctx_size, NULL, /*no_alloc=*/true };
-    struct ggml_context *   gctx = ggml_init(gp);
-    if (!gctx) {
-        qt_log(QT_LOG_ERROR, "[Pipeline] ggml_init failed for encode graph ctx");
-        return {};
-    }
-
+// Build the encoder graph into `gctx`:
+//   audio_in -> SEANet -> encoder transformer -> encoder downsample -> h.
+// Every tensor shape is a pure function of n_samples.
+//
+// When `taps` is non NULL the debug dump outputs are built, named, flagged and
+// expanded too, reproducing the previous dump-mode graph exactly. When it is
+// NULL only the main chain is expanded, which is what the scheduler measure
+// graph wants: its only job is to describe the shapes of the compute.
+//
+// Leaving the dump taps out of the measure graph is deliberate. With a dump
+// requested the real graph has more nodes, so ggml_gallocr_needs_realloc()
+// reports a node count mismatch and ggml_backend_sched_alloc_splits()
+// (ggml-backend.cpp) reserves again from the real graph before allocating -
+// still correct, and only the debug path pays the extra reserve.
+static struct ggml_cgraph * codec_build_encode_graph(struct ggml_context * gctx,
+                                                     PipelineCodec *       pc,
+                                                     int                   n_samples,
+                                                     struct ggml_tensor ** out_audio_in,
+                                                     struct ggml_tensor ** out_positions,
+                                                     struct ggml_tensor ** out_mask,
+                                                     struct ggml_tensor ** out_hidden,
+                                                     CodecEncodeTaps *     taps) {
     // SEANet input shape: [T_audio, 1] f32 T-first (mono waveform).
     struct ggml_tensor * audio_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, n_samples, 1);
     ggml_set_name(audio_in, "audio_in");
@@ -804,85 +954,164 @@ std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc,
     // Transpose to get the buffer layout we want once read back to host.
     h = ggml_cont(gctx, ggml_transpose(gctx, h));  // ne=(512, T)
 
-    const char *         dump            = dump_dir;
-    struct ggml_tensor * h_seanet_dump   = NULL;
-    struct ggml_tensor * sn_init_dump    = NULL;
-    struct ggml_tensor * sn_resnet0_dump = NULL;
-    struct ggml_tensor * sn_stage0_dump  = NULL;
-    struct ggml_tensor * sn_stage1_dump  = NULL;
-    struct ggml_tensor * sn_stage3_dump  = NULL;
-    if (dump) {
+    if (taps) {
+        *taps = CodecEncodeTaps();
+
         // SEANet output naturally lands as ggml ne=(T, hidden) (T innermost).
         // The encoder_transformer and downsample dumps further down are
         // T-first numpy [T, hidden], so we transpose+cont to bring hidden
         // innermost before pinning as a graph output. The dump_2d then
         // emits shape (ne[1], ne[0]) = (T, hidden) on the numpy side.
-        h_seanet_dump = ggml_cont(gctx, ggml_transpose(gctx, h_seanet));
-        ggml_set_output(h_seanet_dump);
-        ggml_set_name(h_seanet_dump, "seanet_out_dump");
+        taps->h_seanet = ggml_cont(gctx, ggml_transpose(gctx, h_seanet));
+        ggml_set_output(taps->h_seanet);
+        ggml_set_name(taps->h_seanet, "seanet_out_dump");
         ggml_set_output(h_et);
         ggml_set_name(h_et, "enc_transformer_out");
+        taps->h_et = h_et;
 
         // SEANet bisection points. Same transpose convention as h_seanet.
         if (sn_init_t) {
-            sn_init_dump = ggml_cont(gctx, ggml_transpose(gctx, sn_init_t));
-            ggml_set_output(sn_init_dump);
-            ggml_set_name(sn_init_dump, "seanet_init_dump");
+            taps->sn_init = ggml_cont(gctx, ggml_transpose(gctx, sn_init_t));
+            ggml_set_output(taps->sn_init);
+            ggml_set_name(taps->sn_init, "seanet_init_dump");
         }
         if (sn_resnet0_t) {
-            sn_resnet0_dump = ggml_cont(gctx, ggml_transpose(gctx, sn_resnet0_t));
-            ggml_set_output(sn_resnet0_dump);
-            ggml_set_name(sn_resnet0_dump, "seanet_resnet0_dump");
+            taps->sn_resnet0 = ggml_cont(gctx, ggml_transpose(gctx, sn_resnet0_t));
+            ggml_set_output(taps->sn_resnet0);
+            ggml_set_name(taps->sn_resnet0, "seanet_resnet0_dump");
         }
         if (sn_stage0_t) {
-            sn_stage0_dump = ggml_cont(gctx, ggml_transpose(gctx, sn_stage0_t));
-            ggml_set_output(sn_stage0_dump);
-            ggml_set_name(sn_stage0_dump, "seanet_stage0_dump");
+            taps->sn_stage0 = ggml_cont(gctx, ggml_transpose(gctx, sn_stage0_t));
+            ggml_set_output(taps->sn_stage0);
+            ggml_set_name(taps->sn_stage0, "seanet_stage0_dump");
         }
         if (sn_stage1_t) {
-            sn_stage1_dump = ggml_cont(gctx, ggml_transpose(gctx, sn_stage1_t));
-            ggml_set_output(sn_stage1_dump);
-            ggml_set_name(sn_stage1_dump, "seanet_stage1_dump");
+            taps->sn_stage1 = ggml_cont(gctx, ggml_transpose(gctx, sn_stage1_t));
+            ggml_set_output(taps->sn_stage1);
+            ggml_set_name(taps->sn_stage1, "seanet_stage1_dump");
         }
         if (sn_stage3_t) {
-            sn_stage3_dump = ggml_cont(gctx, ggml_transpose(gctx, sn_stage3_t));
-            ggml_set_output(sn_stage3_dump);
-            ggml_set_name(sn_stage3_dump, "seanet_stage3_dump");
+            taps->sn_stage3 = ggml_cont(gctx, ggml_transpose(gctx, sn_stage3_t));
+            ggml_set_output(taps->sn_stage3);
+            ggml_set_name(taps->sn_stage3, "seanet_stage3_dump");
         }
     }
 
     ggml_set_name(h, "enc_hidden_out");
     ggml_set_output(h);
 
-    struct ggml_cgraph * graph = ggml_new_graph_custom(gctx, n_max_nodes, false);
+    struct ggml_cgraph * graph = ggml_new_graph_custom(gctx, CODEC_GRAPH_MAX_NODES, false);
     ggml_build_forward_expand(graph, h);
-    if (h_seanet_dump) {
-        ggml_build_forward_expand(graph, h_seanet_dump);
-    }
-    if (sn_init_dump) {
-        ggml_build_forward_expand(graph, sn_init_dump);
-    }
-    if (sn_resnet0_dump) {
-        ggml_build_forward_expand(graph, sn_resnet0_dump);
-    }
-    if (sn_stage0_dump) {
-        ggml_build_forward_expand(graph, sn_stage0_dump);
-    }
-    if (sn_stage1_dump) {
-        ggml_build_forward_expand(graph, sn_stage1_dump);
-    }
-    if (sn_stage3_dump) {
-        ggml_build_forward_expand(graph, sn_stage3_dump);
+    if (taps) {
+        if (taps->h_seanet) {
+            ggml_build_forward_expand(graph, taps->h_seanet);
+        }
+        if (taps->sn_init) {
+            ggml_build_forward_expand(graph, taps->sn_init);
+        }
+        if (taps->sn_resnet0) {
+            ggml_build_forward_expand(graph, taps->sn_resnet0);
+        }
+        if (taps->sn_stage0) {
+            ggml_build_forward_expand(graph, taps->sn_stage0);
+        }
+        if (taps->sn_stage1) {
+            ggml_build_forward_expand(graph, taps->sn_stage1);
+        }
+        if (taps->sn_stage3) {
+            ggml_build_forward_expand(graph, taps->sn_stage3);
+        }
     }
 
+    if (out_audio_in) {
+        *out_audio_in = audio_in;
+    }
+    if (out_positions) {
+        *out_positions = positions;
+    }
+    if (out_mask) {
+        *out_mask = mask;
+    }
+    if (out_hidden) {
+        *out_hidden = h;
+    }
+    return graph;
+}
+
+std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc,
+                                           const float *   audio,
+                                           int             n_samples,
+                                           const char *    dump_dir) {
+    if (!pipeline_codec_ensure_encoder(pc)) {
+        qt_log(QT_LOG_ERROR, "[Pipeline] codec encoder load failed");
+        return {};
+    }
+    if (n_samples <= 0 || (n_samples % TOKENIZER_HOP_LENGTH) != 0) {
+        qt_log(QT_LOG_ERROR, "[Pipeline] n_samples must be a positive multiple of %d (got %d)", TOKENIZER_HOP_LENGTH,
+               n_samples);
+        return {};
+    }
+    int T = n_samples / TOKENIZER_HOP_LENGTH;
+    // Encoder transformer timeline: the post-SEANet T = n_samples / 960.
+    const int T_emb = n_samples / 960;
+
+    // Lazy-load CPU mirror of the RVQ encode codebooks on first call.
+    if (!pc->qenc_host_ready) {
+        quant_encode_host_load(&pc->qenc_sem_host, pc->qenc.semantic, pc->qenc.codebook_size, pc->qenc.codebook_dim,
+                               pc->qenc.hidden_size);
+        quant_encode_host_load(&pc->qenc_aco_host, pc->qenc.acoustic, pc->qenc.codebook_size, pc->qenc.codebook_dim,
+                               pc->qenc.hidden_size);
+        pc->qenc_host_ready = true;
+    }
+
+    const size_t graph_ctx_size = ggml_tensor_overhead() * (size_t) CODEC_GRAPH_MAX_NODES +
+                                  ggml_graph_overhead_custom((size_t) CODEC_GRAPH_MAX_NODES, false);
+
+    struct ggml_init_params gp = { graph_ctx_size, NULL, /*no_alloc=*/true };
+
+    const char * dump = dump_dir;
+
+    struct ggml_context * gctx      = NULL;
+    struct ggml_tensor *  audio_in  = NULL;
+    struct ggml_tensor *  positions = NULL;
+    struct ggml_tensor *  mask      = NULL;
+    struct ggml_tensor *  h         = NULL;
+    CodecEncodeTaps       taps;
+
+    // Rebuilt for every reserve/alloc attempt: the scheduler's split pass
+    // rewrites cross-backend src pointers of the graph it is handed, so each
+    // attempt gets a brand new context and graph.
+    auto build_real = [&]() -> struct ggml_cgraph * {
+        if (gctx) {
+            ggml_free(gctx);
+            gctx = NULL;
+        }
+        gctx = ggml_init(gp);
+        if (!gctx) {
+            qt_log(QT_LOG_ERROR, "[Pipeline] ggml_init failed for encode graph ctx");
+            return NULL;
+        }
+        return codec_build_encode_graph(gctx, pc, n_samples, &audio_in, &positions, &mask, &h, dump ? &taps : NULL);
+    };
+
+    // Measure graph: same builder, main chain only, throwaway context.
+    auto build_measure = [&](struct ggml_context * mctx) -> struct ggml_cgraph * {
+        return codec_build_encode_graph(mctx, pc, n_samples, NULL, NULL, NULL, NULL, NULL);
+    };
+
+    char label[64];
+    snprintf(label, sizeof(label), "encode T=%d", T);
+
     // Reset before alloc: a prior decode/synthesis may have left the shared
-    // codec sched allocated, which trips GGML_ASSERT(!sched->is_alloc). Mirrors
+    // codec sched allocated, which trips GGML_ASSERT(!sched->is_alloc). The
+    // helper also reserves buffers for this exact graph shape first, mirroring
     // the decode path (top of this file) and speaker_encoder_extract.
-    ggml_backend_sched_reset(pc->sched);
-    if (!ggml_backend_sched_alloc_graph(pc->sched, graph)) {
+    struct ggml_cgraph * graph = codec_sched_reserve_and_alloc(pc, build_real, build_measure, label);
+    if (!graph) {
         qt_log(QT_LOG_ERROR, "[Pipeline] encode sched_alloc_graph failed");
-        ggml_backend_sched_reset(pc->sched);
-        ggml_free(gctx);
+        if (gctx) {
+            ggml_free(gctx);
+        }
         return {};
     }
 
@@ -921,23 +1150,23 @@ std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc,
             ggml_backend_tensor_get(t, buf.data(), 0, n * sizeof(float));
             debug_dump_2d(&d, name, buf.data(), (int) t->ne[1], (int) t->ne[0]);
         };
-        dump2("seanet-out", h_seanet_dump);
-        dump2("enc-transformer-out", h_et);
+        dump2("seanet-out", taps.h_seanet);
+        dump2("enc-transformer-out", taps.h_et);
         dump2("codec-pre-fsq", h);
-        if (sn_init_dump) {
-            dump2("seanet-init", sn_init_dump);
+        if (taps.sn_init) {
+            dump2("seanet-init", taps.sn_init);
         }
-        if (sn_resnet0_dump) {
-            dump2("seanet-resnet0", sn_resnet0_dump);
+        if (taps.sn_resnet0) {
+            dump2("seanet-resnet0", taps.sn_resnet0);
         }
-        if (sn_stage0_dump) {
-            dump2("seanet-stage0", sn_stage0_dump);
+        if (taps.sn_stage0) {
+            dump2("seanet-stage0", taps.sn_stage0);
         }
-        if (sn_stage1_dump) {
-            dump2("seanet-stage1", sn_stage1_dump);
+        if (taps.sn_stage1) {
+            dump2("seanet-stage1", taps.sn_stage1);
         }
-        if (sn_stage3_dump) {
-            dump2("seanet-stage3", sn_stage3_dump);
+        if (taps.sn_stage3) {
+            dump2("seanet-stage3", taps.sn_stage3);
         }
     }
 
