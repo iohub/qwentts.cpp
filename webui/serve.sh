@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# 零依赖静态服务器：把本目录的 index.html 托管到 http://127.0.0.1:5173/
+
 # 用法：  ./serve.sh [端口]
 # 说明：  这个脚本只服务 WebUI 静态文件；语音合成仍由 tts-server 提供。
 set -euo pipefail
 
 PORT="${1:-5173}"
-HOST="127.0.0.1"
+HOST="0.0.0.0"
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 cd "$DIR"
